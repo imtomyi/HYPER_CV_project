@@ -1,0 +1,6 @@
+data/waymo_perception/
+data/waymo_camera_frames/
+data/waymo_vehicle_yolo/
+outputs/
+.venv/
+__pycache__/
