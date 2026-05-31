@@ -1,5 +1,6 @@
 data/
 runs/
+report/
 models/
 aihub_yolo_sample/
 *.tar
