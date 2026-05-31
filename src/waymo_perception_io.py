@@ -5,36 +5,46 @@ from __future__ import annotations
 
 import glob
 import sys
+import struct
 from collections.abc import Iterable, Iterator
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
 
 DEFAULT_WAYMO_PERCEPTION_ROOT = Path("data/waymo_perception")
 DEFAULT_SPLITS = ("training", "validation", "testing")
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+GENERATED_PROTO_ROOT = PROJECT_ROOT / ".generated"
 
 
 def require_waymo() -> tuple[Any, Any, Any]:
-    if sys.version_info >= (3, 12):
-        print(
-            "Waymo/TensorFlow dependencies are not expected to work with "
-            f"Python {sys.version_info.major}.{sys.version_info.minor}. "
-            "Use Python 3.10 or 3.11, or run this part in Linux/Colab.",
-            file=sys.stderr,
-        )
-        raise SystemExit(2)
+    tf = None
     try:
         import tensorflow as tf
         from waymo_open_dataset import dataset_pb2
         from waymo_open_dataset import label_pb2
+        return tf, dataset_pb2, label_pb2
     except ModuleNotFoundError:
-        print(
-            "Waymo Perception reading requires TensorFlow and the official "
-            "Waymo package. Install with: "
-            "python -m pip install -r requirements/waymo-perception.txt",
-            file=sys.stderr,
-        )
-        raise SystemExit(2)
+        pass
+
+    if GENERATED_PROTO_ROOT.exists():
+        sys.path.insert(0, str(GENERATED_PROTO_ROOT))
+        try:
+            from waymo_open_dataset import dataset_pb2
+            from waymo_open_dataset import label_pb2
+
+            return None, dataset_pb2, label_pb2
+        except ModuleNotFoundError:
+            pass
+
+    print(
+        "Waymo protobuf modules are unavailable. Install the official Waymo "
+        "package or generate protos under .generated from the Waymo Open "
+        "Dataset repository.",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
     return tf, dataset_pb2, label_pb2
 
 
@@ -73,14 +83,37 @@ def iter_frames(
     tf, dataset_pb2, _ = require_waymo()
     frame_count = 0
     for file_path in discover_tfrecords(files):
-        dataset = tf.data.TFRecordDataset(str(file_path), compression_type="")
-        for frame_index, raw in enumerate(dataset):
+        records = _iter_tf_records_with_tensorflow(tf, file_path) if tf else _iter_tf_records(file_path)
+        for frame_index, raw in enumerate(records):
             frame = dataset_pb2.Frame()
-            frame.ParseFromString(bytearray(raw.numpy()))
+            frame.ParseFromString(raw)
             yield file_path, frame_index, frame
             frame_count += 1
             if max_frames is not None and frame_count >= max_frames:
                 return
+
+
+def _iter_tf_records_with_tensorflow(tf: Any, file_path: Path) -> Iterator[bytes]:
+    dataset = tf.data.TFRecordDataset(str(file_path), compression_type="")
+    for raw in dataset:
+        yield bytes(raw.numpy())
+
+
+def _iter_tf_records(file_path: Path) -> Iterator[bytes]:
+    with file_path.open("rb") as file:
+        while True:
+            length_bytes = file.read(8)
+            if not length_bytes:
+                return
+            if len(length_bytes) != 8:
+                raise ValueError(f"Corrupt TFRecord length in {file_path}")
+            length = struct.unpack("<Q", length_bytes)[0]
+            file.read(4)
+            data = file.read(length)
+            if len(data) != length:
+                raise ValueError(f"Corrupt TFRecord payload in {file_path}")
+            file.read(4)
+            yield data
 
 
 def camera_name(dataset_pb2: Any, camera_id: int) -> str:
@@ -127,9 +160,22 @@ def selected_camera_names(dataset_pb2: Any, names: list[str]) -> set[str] | None
 
 def decode_jpeg_size(image_bytes: bytes) -> tuple[int, int]:
     tf, _, _ = require_waymo()
-    image = tf.io.decode_jpeg(image_bytes, channels=3)
-    height, width = [int(value) for value in tf.shape(image)[:2].numpy()]
-    return width, height
+    if tf is not None:
+        image = tf.io.decode_jpeg(image_bytes, channels=3)
+        height, width = [int(value) for value in tf.shape(image)[:2].numpy()]
+        return width, height
+
+    try:
+        from PIL import Image
+    except ModuleNotFoundError:
+        print(
+            "Pillow is required to decode Waymo JPEG sizes. Install with: "
+            "python -m pip install pillow",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    with Image.open(BytesIO(image_bytes)) as image:
+        return image.size
 
 
 def yolo_box_from_waymo_label(label: Any, image_width: int, image_height: int) -> str | None:
